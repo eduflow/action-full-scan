@@ -3787,7 +3787,7 @@ exports.issueCommand = issueCommand;
 
 const core = __webpack_require__(470);
 const exec = __webpack_require__(986);
-const common = __webpack_require__(374);
+const common = __webpack_require__(694);
 const _ = __webpack_require__(557);
 
 // Default file names
@@ -3809,6 +3809,7 @@ async function run() {
         let issueTitle = core.getInput('issue_title');
         let failAction = core.getInput('fail_action');
         let allowIssueWriting = core.getInput('allow_issue_writing');
+        let artifactName = core.getInput('artifact_name');
         let createIssue = true;
 
         if (!(String(failAction).toLowerCase() === 'true' || String(failAction).toLowerCase() === 'false')) {
@@ -3816,6 +3817,11 @@ async function run() {
         }
         if (String(allowIssueWriting).toLowerCase() === 'false') {
             createIssue = false;
+        }
+
+        if (!artifactName) {
+            console.log('[WARNING]: \'artifact_name\' action input should not be empty. Setting it back to the default name.');
+            artifactName = 'zap_scan';
         }
 
         console.log('starting the program');
@@ -3850,7 +3856,7 @@ async function run() {
                 console.log('Scanning process completed, starting to analyze the results!')
             }
         }
-        await common.main.processReport(token, workspace, plugins, currentRunnerID, issueTitle, repoName, createIssue);
+        await common.main.processReport(token, workspace, plugins, currentRunnerID, issueTitle, repoName, { allowIssueWriting: createIssue,  artifactName });
     } catch (error) {
         core.setFailed(error.message);
     }
@@ -8180,265 +8186,7 @@ module.exports = opts => {
 /* 171 */,
 /* 172 */,
 /* 173 */,
-/* 174 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-const fs = __webpack_require__(747);
-const _ = __webpack_require__(557);
-const readline = __webpack_require__(58);
-const AdmZip = __webpack_require__(639);
-const request = __webpack_require__(830);
-const artifact = __webpack_require__(214);
-
-function createReadStreamSafe(filename, options) {
-    return new Promise((resolve, reject) => {
-        const fileStream = fs.createReadStream(filename, options);
-        fileStream.on('error', reject).on('open', () => {
-            resolve(fileStream);
-        });
-    });
-}
-
-let actionHelper = {
-
-    getRunnerID: ((body) => {
-        let results = body.match('RunnerID:\\d+');
-        if (results !== null && results.length !== 0) {
-            return results[0].split(':')[1];
-        }
-        return null;
-    }),
-
-    processLineByLine: (async (tsvFile) => {
-        let plugins = [];
-        try {
-            const fileStream = await createReadStreamSafe(tsvFile);
-            const rl = readline.createInterface({
-                input: fileStream,
-                crlfDelay: Infinity
-            });
-            for await (const line of rl) {
-                if (line.charAt(0) !== '#') {
-                    let tmp = line.split('\t');
-                    if (tmp[0].trim() !== '' && tmp[1].trim().toUpperCase() === 'IGNORE') {
-                        plugins.push(tmp[0].trim());
-                    }
-                }
-            }
-        } catch (err) {
-            console.log(`Error when reading the rules file: ${tsvFile}`)
-        }
-
-        return plugins;
-    }),
-
-    createMessage: ((sites, runnerID, runnerLink) => {
-        const NXT_LINE = '\n';
-        const TAB = "\t";
-        const BULLET = "-";
-        let msg = '';
-        let instanceCount = 5;
-
-        sites.forEach((site => {
-            msg = msg + `${BULLET} Site: [${site["@name"]}](${site["@name"]}) ${NXT_LINE}`;
-            if (site.hasOwnProperty('alerts')) {
-                if (site.alerts.length !== 0) {
-                    msg = `${msg} ${TAB} **New Alerts** ${NXT_LINE}`;
-                    site.alerts.forEach((alert) => {
-                        msg = msg + TAB + `${BULLET} **${alert.name}** [${alert.pluginid}] total: ${alert.instances.length}:  ${NXT_LINE}`
-
-                        for (let i = 0; i < alert['instances'].length; i++) {
-                            if (i >= instanceCount) {
-                                msg = msg + TAB + TAB + `${BULLET} .. ${NXT_LINE}`;
-                                break
-                            }
-                            let instance = alert['instances'][i];
-                            msg = msg + TAB + TAB + `${BULLET} [${instance.uri}](${instance.uri}) ${NXT_LINE}`;
-                        }
-                    });
-                    msg = msg + NXT_LINE
-                }
-            }
-
-            if (site.hasOwnProperty('removedAlerts')) {
-                if (site.removedAlerts.length !== 0) {
-                    msg = `${msg} ${TAB} **Resolved Alerts** ${NXT_LINE}`;
-                    site.removedAlerts.forEach((alert) => {
-                        msg = msg + TAB + `${BULLET} **${alert.name}** [${alert.pluginid}] total: ${alert.instances.length}:  ${NXT_LINE}`
-                    });
-                    msg = msg + NXT_LINE
-                }
-            }
-
-            if (site.hasOwnProperty('ignoredAlerts')) {
-                if (site.ignoredAlerts.length !== 0) {
-                    msg = `${msg} ${TAB} **Ignored Alerts** ${NXT_LINE}`;
-                    site.ignoredAlerts.forEach((alert) => {
-                        msg = msg + TAB + `${BULLET} **${alert.name}** [${alert.pluginid}] total: ${alert.instances.length}:  ${NXT_LINE}`
-                    });
-                    msg = msg + NXT_LINE
-                }
-            }
-
-            msg = msg + NXT_LINE
-        }));
-        if (msg.trim() !== '') {
-            msg = msg + NXT_LINE + runnerLink;
-            msg = msg + NXT_LINE + runnerID;
-        }
-        return msg
-    }),
-
-    generateDifference: ((newReport, oldReport) => {
-        newReport.updated = false;
-        let siteClone = [];
-        newReport.site.forEach((newReportSite) => {
-            // Check if the new report site already exists in the previous report
-            let previousSite = _.filter(oldReport.site, s => s['@name'] === newReportSite['@name']);
-            // If does not exists add it to the array without further processing
-            if (previousSite.length === 0) {
-                newReport.updated = true;
-                siteClone.push(newReportSite);
-            } else {
-                // deep clone the variable for further processing
-                let newSite = JSON.parse(JSON.stringify(newReportSite));
-                let currentAlerts = newReportSite.alerts;
-                let previousAlerts = previousSite[0].alerts;
-
-                let newAlerts = _.differenceBy(currentAlerts, previousAlerts, 'pluginid');
-                let removedAlerts = _.differenceBy(previousAlerts, currentAlerts, 'pluginid');
-
-                let ignoredAlerts = [];
-                if (newReportSite.hasOwnProperty('ignoredAlerts') && previousSite[0].hasOwnProperty('ignoredAlerts')) {
-                    ignoredAlerts = _.differenceBy(newReportSite['ignoredAlerts'], previousSite[0]['ignoredAlerts'], 'pluginid');
-                }else if(newReportSite.hasOwnProperty('ignoredAlerts')){
-                    ignoredAlerts = newReportSite['ignoredAlerts']
-                }
-
-                removedAlerts = _.differenceBy(removedAlerts, ignoredAlerts, 'pluginid');
-
-                newSite.alerts = newAlerts;
-                newSite.removedAlerts = removedAlerts;
-                newSite.ignoredAlerts = ignoredAlerts;
-                siteClone.push(newSite);
-
-                if (newAlerts.length !== 0 || removedAlerts.length !== 0 || ignoredAlerts.length !== 0) {
-                    newReport.updated = true;
-                }
-            }
-        });
-        return siteClone;
-    }),
-
-    readMDFile: (async (reportName) => {
-        let res = '';
-        try {
-            res = fs.readFileSync(reportName, {encoding: 'base64'});
-        } catch (err) {
-            console.log('error while reading the markdown file!')
-        }
-        return res;
-    }),
-
-    checkIfAlertsExists: ((jsonReport) => {
-        return jsonReport.site.some((s) => {
-            return (s.hasOwnProperty('alerts') && s.alerts.length !== 0);
-        });
-    }),
-
-
-    filterReport: (async (jsonReport, plugins) => {
-        jsonReport.site.forEach((s) => {
-            if (s.hasOwnProperty('alerts') && s.alerts.length !== 0) {
-                console.log(`starting to filter the alerts for site: ${s['@name']}`);
-                let newAlerts = s.alerts.filter(function (e) {
-                    return !plugins.includes(e.pluginid)
-                });
-                let removedAlerts = s.alerts.filter(function (e) {
-                    return plugins.includes(e.pluginid)
-                });
-                s.alerts = newAlerts;
-                s.ignoredAlerts = removedAlerts;
-
-                console.log(`#${newAlerts.length} alerts have been identified` +
-                    ` and #${removedAlerts.length} alerts have been ignored for the site.`);
-            }
-        });
-        return jsonReport;
-    }),
-
-
-    readPreviousReport: (async (octokit, owner, repo, workSpace, runnerID) => {
-        let previousReport;
-        try{
-            let artifactList = await octokit.actions.listWorkflowRunArtifacts({
-                owner: owner,
-                repo: repo,
-                run_id: runnerID
-            });
-
-            let artifacts = artifactList.data.artifacts;
-            let artifactID;
-            if (artifacts.length !== 0) {
-                artifacts.forEach((a => {
-                    if (a['name'] === 'zap_scan') {
-                        artifactID = a['id']
-                    }
-                }));
-            }
-
-            if (artifactID !== undefined) {
-                let download = await octokit.actions.downloadArtifact({
-                    owner: owner,
-                    repo: repo,
-                    artifact_id: artifactID,
-                    archive_format: 'zip'
-                });
-
-                await new Promise(resolve =>
-                    request(download.url)
-                        .pipe(fs.createWriteStream(`${workSpace}/zap_scan.zip`))
-                        .on('finish', () => {
-                            resolve();
-                        }));
-
-                let zip = new AdmZip(`${workSpace}/zap_scan.zip`);
-                let zipEntries = zip.getEntries();
-
-                await zipEntries.forEach(function (zipEntry) {
-                    if (zipEntry.entryName === "report_json.json") {
-                        previousReport = JSON.parse(zipEntry.getData().toString('utf8'));
-                    }
-                });
-            }
-        }catch (e) {
-            console.log(`Error occurred while downloading the artifacts!`)
-        }
-        return previousReport;
-    }),
-
-    uploadArtifacts: (async (rootDir, mdReport, jsonReport, htmlReport) => {
-        const artifactClient = artifact.create();
-        const artifactName = 'zap_scan';
-        const files = [
-            `${rootDir}/${mdReport}`,
-            `${rootDir}/${jsonReport}`,
-            `${rootDir}/${htmlReport}`,
-        ];
-        const rootDirectory = rootDir;
-        const options = {
-            continueOnError: true
-        };
-
-        await artifactClient.uploadArtifact(artifactName, files, rootDirectory, options)
-    })
-
-};
-
-module.exports = actionHelper;
-
-
-/***/ }),
+/* 174 */,
 /* 175 */,
 /* 176 */,
 /* 177 */,
@@ -11297,7 +11045,7 @@ exports.create = create;
 /* 215 */
 /***/ (function(module) {
 
-module.exports = {"_args":[["@octokit/rest@16.43.1","/action"]],"_from":"@octokit/rest@16.43.1","_id":"@octokit/rest@16.43.1","_inBundle":false,"_integrity":"sha512-gfFKwRT/wFxq5qlNjnW2dh+qh74XgTQ2B179UX5K1HYCluioWj8Ndbgqw2PVqa1NnVJkGHp2ovMpVn/DImlmkw==","_location":"/@octokit/rest","_phantomChildren":{"@octokit/types":"2.8.0","deprecation":"2.3.1","once":"1.4.0","os-name":"3.1.0"},"_requested":{"type":"version","registry":true,"raw":"@octokit/rest@16.43.1","name":"@octokit/rest","escapedName":"@octokit%2frest","scope":"@octokit","rawSpec":"16.43.1","saveSpec":null,"fetchSpec":"16.43.1"},"_requiredBy":["/@actions/github"],"_resolved":"https://registry.npmjs.org/@octokit/rest/-/rest-16.43.1.tgz","_spec":"16.43.1","_where":"/action","author":{"name":"Gregor Martynus","url":"https://github.com/gr2m"},"bugs":{"url":"https://github.com/octokit/rest.js/issues"},"bundlesize":[{"path":"./dist/octokit-rest.min.js.gz","maxSize":"33 kB"}],"contributors":[{"name":"Mike de Boer","email":"info@mikedeboer.nl"},{"name":"Fabian Jakobs","email":"fabian@c9.io"},{"name":"Joe Gallo","email":"joe@brassafrax.com"},{"name":"Gregor Martynus","url":"https://github.com/gr2m"}],"dependencies":{"@octokit/auth-token":"^2.4.0","@octokit/plugin-paginate-rest":"^1.1.1","@octokit/plugin-request-log":"^1.0.0","@octokit/plugin-rest-endpoint-methods":"2.4.0","@octokit/request":"^5.2.0","@octokit/request-error":"^1.0.2","atob-lite":"^2.0.0","before-after-hook":"^2.0.0","btoa-lite":"^1.0.0","deprecation":"^2.0.0","lodash.get":"^4.4.2","lodash.set":"^4.3.2","lodash.uniq":"^4.5.0","octokit-pagination-methods":"^1.1.0","once":"^1.4.0","universal-user-agent":"^4.0.0"},"description":"GitHub REST API client for Node.js","devDependencies":{"@gimenete/type-writer":"^0.1.3","@octokit/auth":"^1.1.1","@octokit/fixtures-server":"^5.0.6","@octokit/graphql":"^4.2.0","@types/node":"^13.1.0","bundlesize":"^0.18.0","chai":"^4.1.2","compression-webpack-plugin":"^3.1.0","cypress":"^3.0.0","glob":"^7.1.2","http-proxy-agent":"^4.0.0","lodash.camelcase":"^4.3.0","lodash.merge":"^4.6.1","lodash.upperfirst":"^4.3.1","lolex":"^5.1.2","mkdirp":"^1.0.0","mocha":"^7.0.1","mustache":"^4.0.0","nock":"^11.3.3","npm-run-all":"^4.1.2","nyc":"^15.0.0","prettier":"^1.14.2","proxy":"^1.0.0","semantic-release":"^17.0.0","sinon":"^8.0.0","sinon-chai":"^3.0.0","sort-keys":"^4.0.0","string-to-arraybuffer":"^1.0.0","string-to-jsdoc-comment":"^1.0.0","typescript":"^3.3.1","webpack":"^4.0.0","webpack-bundle-analyzer":"^3.0.0","webpack-cli":"^3.0.0"},"files":["index.js","index.d.ts","lib","plugins"],"homepage":"https://github.com/octokit/rest.js#readme","keywords":["octokit","github","rest","api-client"],"license":"MIT","name":"@octokit/rest","nyc":{"ignore":["test"]},"publishConfig":{"access":"public"},"release":{"publish":["@semantic-release/npm",{"path":"@semantic-release/github","assets":["dist/*","!dist/*.map.gz"]}]},"repository":{"type":"git","url":"git+https://github.com/octokit/rest.js.git"},"scripts":{"build":"npm-run-all build:*","build:browser":"npm-run-all build:browser:*","build:browser:development":"webpack --mode development --entry . --output-library=Octokit --output=./dist/octokit-rest.js --profile --json > dist/bundle-stats.json","build:browser:production":"webpack --mode production --entry . --plugin=compression-webpack-plugin --output-library=Octokit --output-path=./dist --output-filename=octokit-rest.min.js --devtool source-map","build:ts":"npm run -s update-endpoints:typescript","coverage":"nyc report --reporter=html && open coverage/index.html","generate-bundle-report":"webpack-bundle-analyzer dist/bundle-stats.json --mode=static --no-open --report dist/bundle-report.html","lint":"prettier --check '{lib,plugins,scripts,test}/**/*.{js,json,ts}' 'docs/*.{js,json}' 'docs/src/**/*' index.js README.md package.json","lint:fix":"prettier --write '{lib,plugins,scripts,test}/**/*.{js,json,ts}' 'docs/*.{js,json}' 'docs/src/**/*' index.js README.md package.json","postvalidate:ts":"tsc --noEmit --target es6 test/typescript-validate.ts","prebuild:browser":"mkdirp dist/","pretest":"npm run -s lint","prevalidate:ts":"npm run -s build:ts","start-fixtures-server":"octokit-fixtures-server","test":"nyc mocha test/mocha-node-setup.js \"test/*/**/*-test.js\"","test:browser":"cypress run --browser chrome","update-endpoints":"npm-run-all update-endpoints:*","update-endpoints:fetch-json":"node scripts/update-endpoints/fetch-json","update-endpoints:typescript":"node scripts/update-endpoints/typescript","validate:ts":"tsc --target es6 --noImplicitAny index.d.ts"},"types":"index.d.ts","version":"16.43.1"};
+module.exports = {"_args":[["@octokit/rest@16.43.1","/home/t/work/zaproxy/action-full-scan"]],"_from":"@octokit/rest@16.43.1","_id":"@octokit/rest@16.43.1","_inBundle":false,"_integrity":"sha512-gfFKwRT/wFxq5qlNjnW2dh+qh74XgTQ2B179UX5K1HYCluioWj8Ndbgqw2PVqa1NnVJkGHp2ovMpVn/DImlmkw==","_location":"/@octokit/rest","_phantomChildren":{"@octokit/types":"2.8.0","deprecation":"2.3.1","once":"1.4.0","os-name":"3.1.0"},"_requested":{"type":"version","registry":true,"raw":"@octokit/rest@16.43.1","name":"@octokit/rest","escapedName":"@octokit%2frest","scope":"@octokit","rawSpec":"16.43.1","saveSpec":null,"fetchSpec":"16.43.1"},"_requiredBy":["/@actions/github"],"_resolved":"https://registry.npmjs.org/@octokit/rest/-/rest-16.43.1.tgz","_spec":"16.43.1","_where":"/home/t/work/zaproxy/action-full-scan","author":{"name":"Gregor Martynus","url":"https://github.com/gr2m"},"bugs":{"url":"https://github.com/octokit/rest.js/issues"},"bundlesize":[{"path":"./dist/octokit-rest.min.js.gz","maxSize":"33 kB"}],"contributors":[{"name":"Mike de Boer","email":"info@mikedeboer.nl"},{"name":"Fabian Jakobs","email":"fabian@c9.io"},{"name":"Joe Gallo","email":"joe@brassafrax.com"},{"name":"Gregor Martynus","url":"https://github.com/gr2m"}],"dependencies":{"@octokit/auth-token":"^2.4.0","@octokit/plugin-paginate-rest":"^1.1.1","@octokit/plugin-request-log":"^1.0.0","@octokit/plugin-rest-endpoint-methods":"2.4.0","@octokit/request":"^5.2.0","@octokit/request-error":"^1.0.2","atob-lite":"^2.0.0","before-after-hook":"^2.0.0","btoa-lite":"^1.0.0","deprecation":"^2.0.0","lodash.get":"^4.4.2","lodash.set":"^4.3.2","lodash.uniq":"^4.5.0","octokit-pagination-methods":"^1.1.0","once":"^1.4.0","universal-user-agent":"^4.0.0"},"description":"GitHub REST API client for Node.js","devDependencies":{"@gimenete/type-writer":"^0.1.3","@octokit/auth":"^1.1.1","@octokit/fixtures-server":"^5.0.6","@octokit/graphql":"^4.2.0","@types/node":"^13.1.0","bundlesize":"^0.18.0","chai":"^4.1.2","compression-webpack-plugin":"^3.1.0","cypress":"^3.0.0","glob":"^7.1.2","http-proxy-agent":"^4.0.0","lodash.camelcase":"^4.3.0","lodash.merge":"^4.6.1","lodash.upperfirst":"^4.3.1","lolex":"^5.1.2","mkdirp":"^1.0.0","mocha":"^7.0.1","mustache":"^4.0.0","nock":"^11.3.3","npm-run-all":"^4.1.2","nyc":"^15.0.0","prettier":"^1.14.2","proxy":"^1.0.0","semantic-release":"^17.0.0","sinon":"^8.0.0","sinon-chai":"^3.0.0","sort-keys":"^4.0.0","string-to-arraybuffer":"^1.0.0","string-to-jsdoc-comment":"^1.0.0","typescript":"^3.3.1","webpack":"^4.0.0","webpack-bundle-analyzer":"^3.0.0","webpack-cli":"^3.0.0"},"files":["index.js","index.d.ts","lib","plugins"],"homepage":"https://github.com/octokit/rest.js#readme","keywords":["octokit","github","rest","api-client"],"license":"MIT","name":"@octokit/rest","nyc":{"ignore":["test"]},"publishConfig":{"access":"public"},"release":{"publish":["@semantic-release/npm",{"path":"@semantic-release/github","assets":["dist/*","!dist/*.map.gz"]}]},"repository":{"type":"git","url":"git+https://github.com/octokit/rest.js.git"},"scripts":{"build":"npm-run-all build:*","build:browser":"npm-run-all build:browser:*","build:browser:development":"webpack --mode development --entry . --output-library=Octokit --output=./dist/octokit-rest.js --profile --json > dist/bundle-stats.json","build:browser:production":"webpack --mode production --entry . --plugin=compression-webpack-plugin --output-library=Octokit --output-path=./dist --output-filename=octokit-rest.min.js --devtool source-map","build:ts":"npm run -s update-endpoints:typescript","coverage":"nyc report --reporter=html && open coverage/index.html","generate-bundle-report":"webpack-bundle-analyzer dist/bundle-stats.json --mode=static --no-open --report dist/bundle-report.html","lint":"prettier --check '{lib,plugins,scripts,test}/**/*.{js,json,ts}' 'docs/*.{js,json}' 'docs/src/**/*' index.js README.md package.json","lint:fix":"prettier --write '{lib,plugins,scripts,test}/**/*.{js,json,ts}' 'docs/*.{js,json}' 'docs/src/**/*' index.js README.md package.json","postvalidate:ts":"tsc --noEmit --target es6 test/typescript-validate.ts","prebuild:browser":"mkdirp dist/","pretest":"npm run -s lint","prevalidate:ts":"npm run -s build:ts","start-fixtures-server":"octokit-fixtures-server","test":"nyc mocha test/mocha-node-setup.js \"test/*/**/*-test.js\"","test:browser":"cypress run --browser chrome","update-endpoints":"npm-run-all update-endpoints:*","update-endpoints:fetch-json":"node scripts/update-endpoints/fetch-json","update-endpoints:typescript":"node scripts/update-endpoints/typescript","validate:ts":"tsc --target es6 --noImplicitAny index.d.ts"},"types":"index.d.ts","version":"16.43.1"};
 
 /***/ }),
 /* 216 */,
@@ -18435,7 +18183,7 @@ exports.require = function() {
 /* 314 */
 /***/ (function(module) {
 
-module.exports = {"_args":[["@octokit/graphql@2.1.3","/action"]],"_from":"@octokit/graphql@2.1.3","_id":"@octokit/graphql@2.1.3","_inBundle":false,"_integrity":"sha512-XoXJqL2ondwdnMIW3wtqJWEwcBfKk37jO/rYkoxNPEVeLBDGsGO1TCWggrAlq3keGt/O+C/7VepXnukUxwt5vA==","_location":"/@octokit/graphql","_phantomChildren":{},"_requested":{"type":"version","registry":true,"raw":"@octokit/graphql@2.1.3","name":"@octokit/graphql","escapedName":"@octokit%2fgraphql","scope":"@octokit","rawSpec":"2.1.3","saveSpec":null,"fetchSpec":"2.1.3"},"_requiredBy":["/@actions/github"],"_resolved":"https://registry.npmjs.org/@octokit/graphql/-/graphql-2.1.3.tgz","_spec":"2.1.3","_where":"/action","author":{"name":"Gregor Martynus","url":"https://github.com/gr2m"},"bugs":{"url":"https://github.com/octokit/graphql.js/issues"},"bundlesize":[{"path":"./dist/octokit-graphql.min.js.gz","maxSize":"5KB"}],"dependencies":{"@octokit/request":"^5.0.0","universal-user-agent":"^2.0.3"},"description":"GitHub GraphQL API client for browsers and Node","devDependencies":{"chai":"^4.2.0","compression-webpack-plugin":"^2.0.0","coveralls":"^3.0.3","cypress":"^3.1.5","fetch-mock":"^7.3.1","mkdirp":"^0.5.1","mocha":"^6.0.0","npm-run-all":"^4.1.3","nyc":"^14.0.0","semantic-release":"^15.13.3","simple-mock":"^0.8.0","standard":"^12.0.1","webpack":"^4.29.6","webpack-bundle-analyzer":"^3.1.0","webpack-cli":"^3.2.3"},"files":["lib"],"homepage":"https://github.com/octokit/graphql.js#readme","keywords":["octokit","github","api","graphql"],"license":"MIT","main":"index.js","name":"@octokit/graphql","publishConfig":{"access":"public"},"release":{"publish":["@semantic-release/npm",{"path":"@semantic-release/github","assets":["dist/*","!dist/*.map.gz"]}]},"repository":{"type":"git","url":"git+https://github.com/octokit/graphql.js.git"},"scripts":{"build":"npm-run-all build:*","build:development":"webpack --mode development --entry . --output-library=octokitGraphql --output=./dist/octokit-graphql.js --profile --json > dist/bundle-stats.json","build:production":"webpack --mode production --entry . --plugin=compression-webpack-plugin --output-library=octokitGraphql --output-path=./dist --output-filename=octokit-graphql.min.js --devtool source-map","bundle-report":"webpack-bundle-analyzer dist/bundle-stats.json --mode=static --no-open --report dist/bundle-report.html","coverage":"nyc report --reporter=html && open coverage/index.html","coverage:upload":"nyc report --reporter=text-lcov | coveralls","prebuild":"mkdirp dist/","pretest":"standard","test":"nyc mocha test/*-test.js","test:browser":"cypress run --browser chrome"},"standard":{"globals":["describe","before","beforeEach","afterEach","after","it","expect"]},"version":"2.1.3"};
+module.exports = {"_args":[["@octokit/graphql@2.1.3","/home/t/work/zaproxy/action-full-scan"]],"_from":"@octokit/graphql@2.1.3","_id":"@octokit/graphql@2.1.3","_inBundle":false,"_integrity":"sha512-XoXJqL2ondwdnMIW3wtqJWEwcBfKk37jO/rYkoxNPEVeLBDGsGO1TCWggrAlq3keGt/O+C/7VepXnukUxwt5vA==","_location":"/@octokit/graphql","_phantomChildren":{},"_requested":{"type":"version","registry":true,"raw":"@octokit/graphql@2.1.3","name":"@octokit/graphql","escapedName":"@octokit%2fgraphql","scope":"@octokit","rawSpec":"2.1.3","saveSpec":null,"fetchSpec":"2.1.3"},"_requiredBy":["/@actions/github"],"_resolved":"https://registry.npmjs.org/@octokit/graphql/-/graphql-2.1.3.tgz","_spec":"2.1.3","_where":"/home/t/work/zaproxy/action-full-scan","author":{"name":"Gregor Martynus","url":"https://github.com/gr2m"},"bugs":{"url":"https://github.com/octokit/graphql.js/issues"},"bundlesize":[{"path":"./dist/octokit-graphql.min.js.gz","maxSize":"5KB"}],"dependencies":{"@octokit/request":"^5.0.0","universal-user-agent":"^2.0.3"},"description":"GitHub GraphQL API client for browsers and Node","devDependencies":{"chai":"^4.2.0","compression-webpack-plugin":"^2.0.0","coveralls":"^3.0.3","cypress":"^3.1.5","fetch-mock":"^7.3.1","mkdirp":"^0.5.1","mocha":"^6.0.0","npm-run-all":"^4.1.3","nyc":"^14.0.0","semantic-release":"^15.13.3","simple-mock":"^0.8.0","standard":"^12.0.1","webpack":"^4.29.6","webpack-bundle-analyzer":"^3.1.0","webpack-cli":"^3.2.3"},"files":["lib"],"homepage":"https://github.com/octokit/graphql.js#readme","keywords":["octokit","github","api","graphql"],"license":"MIT","main":"index.js","name":"@octokit/graphql","publishConfig":{"access":"public"},"release":{"publish":["@semantic-release/npm",{"path":"@semantic-release/github","assets":["dist/*","!dist/*.map.gz"]}]},"repository":{"type":"git","url":"git+https://github.com/octokit/graphql.js.git"},"scripts":{"build":"npm-run-all build:*","build:development":"webpack --mode development --entry . --output-library=octokitGraphql --output=./dist/octokit-graphql.js --profile --json > dist/bundle-stats.json","build:production":"webpack --mode production --entry . --plugin=compression-webpack-plugin --output-library=octokitGraphql --output-path=./dist --output-filename=octokit-graphql.min.js --devtool source-map","bundle-report":"webpack-bundle-analyzer dist/bundle-stats.json --mode=static --no-open --report dist/bundle-report.html","coverage":"nyc report --reporter=html && open coverage/index.html","coverage:upload":"nyc report --reporter=text-lcov | coveralls","prebuild":"mkdirp dist/","pretest":"standard","test":"nyc mocha test/*-test.js","test:browser":"cypress run --browser chrome"},"standard":{"globals":["describe","before","beforeEach","afterEach","after","it","expect"]},"version":"2.1.3"};
 
 /***/ }),
 /* 315 */
@@ -20349,201 +20097,125 @@ function deprecate (message) {
 /* 372 */,
 /* 373 */,
 /* 374 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/***/ (function(module) {
 
-const core = __webpack_require__(470);
-const exec = __webpack_require__(986);
-const fs = __webpack_require__(747);
-const github = __webpack_require__(469);
-const _ = __webpack_require__(557);
-const actionHelper = __webpack_require__(174);
+"use strict";
 
-let actionCommon = {
-    processReport: (async (token, workSpace, plugins, currentRunnerID, issueTitle, repoName, allowIssueWriting = true) => {
-        let jsonReportName = 'report_json.json';
-        let mdReportName = 'report_md.md';
-        let htmlReportName = 'report_html.html';
 
-        if (!allowIssueWriting) {
-            actionHelper.uploadArtifacts(workSpace, mdReportName, jsonReportName, htmlReportName);
-            return;
-        }
+var hasOwn = Object.prototype.hasOwnProperty;
+var toStr = Object.prototype.toString;
+var defineProperty = Object.defineProperty;
+var gOPD = Object.getOwnPropertyDescriptor;
 
-        let openIssue;
-        let currentReport;
-        let previousRunnerID;
-        let previousReport = {};
-        let create_new_issue = false;
+var isArray = function isArray(arr) {
+	if (typeof Array.isArray === 'function') {
+		return Array.isArray(arr);
+	}
 
-        // Forward variable declarations
-        let octokit;
-        let context;
-        let owner;
-        let repo;
-
-        let tmp = repoName.split('/');
-        owner = tmp[0];
-        repo = tmp[1];
-
-        octokit = await new github.GitHub(token);
-        context = github.context;
-
-        try {
-            let jReportFile = fs.readFileSync(`${workSpace}/${jsonReportName}`);
-            currentReport = JSON.parse(jReportFile);
-        } catch (e) {
-            console.log('Failed to locate the json report generated by ZAP Scan!');
-            return
-        }
-
-        let issues = await octokit.search.issuesAndPullRequests({
-            q: encodeURI(`is:issue state:open repo:${owner}/${repo} ${issueTitle}`).replace(/%20/g,'+'),
-            sort: 'updated'
-        });
-
-        // If there is no existing open issue then create a new issue
-        if (issues.data.items.length === 0) {
-            create_new_issue = true;
-        }else {
-            // Sometimes search API returns recently closed issue as an open issue
-            for (let i = 0; i < issues.data.items.length; i++) {
-                let issue = issues.data.items[i];
-                if(issue['state'] === 'open' && issue['user']['login'] === 'github-actions[bot]'){
-                    openIssue = issue;
-                    break
-                }
-            }
-
-            if (openIssue === undefined) {
-                create_new_issue = true;
-            }else {
-                console.log(`Ongoing open issue has been identified #${openIssue['number']}`);
-                // If there is no comments then read the body
-                if (openIssue['comments'] === 0) {
-                    previousRunnerID = actionHelper.getRunnerID(openIssue['body']);
-                }else {
-                    let comments = await octokit.issues.listComments({
-                        owner: owner,
-                        repo: repo,
-                        issue_number: openIssue['number']
-                    });
-
-                    let lastBotComment;
-                    let lastCommentIndex = comments['data'].length - 1;
-                    for (let i = lastCommentIndex; i >= 0; i--) {
-                        if (comments['data'][i]['user']['login'] === 'github-actions[bot]') {
-                            lastBotComment = comments['data'][i];
-                            break;
-                        }
-                    }
-
-                    if (lastBotComment === undefined) {
-                        previousRunnerID = actionHelper.getRunnerID(openIssue['body']);
-                    }else {
-                        previousRunnerID = actionHelper.getRunnerID(lastBotComment['body']);
-                    }
-                }
-
-                if (previousRunnerID !== null) {
-                    previousReport = await actionHelper.readPreviousReport(octokit, owner, repo, workSpace, previousRunnerID);
-                    if (previousReport === undefined) {
-                        create_new_issue = true;
-                    }
-                }
-            }
-        }
-
-        if (plugins.length !== 0) {
-            console.log(`${plugins.length} plugins will be ignored according to the rules configuration`);
-            currentReport = await actionHelper.filterReport(currentReport, plugins);
-
-            // Update the newly filtered report
-            fs.unlinkSync(`${workSpace}/${jsonReportName}`);
-            fs.writeFileSync(`${workSpace}/${jsonReportName}`, JSON.stringify(currentReport));
-            console.log('The current report is updated with the ignored alerts!')
-        }
-
-        let newAlertExits = actionHelper.checkIfAlertsExists(currentReport);
-
-        console.log(`Alerts present in the current report: ${newAlertExits}`);
-
-        if (!newAlertExits) {
-            // If no new alerts have been found close the issue
-            console.log('No new alerts have been identified by the ZAP Scan');
-            if (openIssue != null && openIssue.state === 'open') {
-                // close the issue with a comment
-                console.log(`Starting to close the issue #${openIssue.number}`);
-                try{
-                    await octokit.issues.createComment({
-                        owner: owner,
-                        repo: repo,
-                        issue_number: openIssue.number,
-                        body: 'All the alerts have been resolved during the last ZAP Scan!'
-                    });
-                    await octokit.issues.update({
-                        owner: owner,
-                        repo: repo,
-                        issue_number: openIssue.number,
-                        state: 'closed'
-                    });
-                    console.log(`Successfully closed the issue #${openIssue.number}`);
-                }catch (err) {
-                    console.log(`Error occurred while closing the issue with a comment! err: ${err}`)
-                }
-            }else if (openIssue != null && openIssue.state === 'closed') {
-                console.log('No alerts found by ZAP Scan and no active issue is found in the repository, exiting the program!');
-            }
-            return;
-        }
-
-        let runnerInfo = `RunnerID:${currentRunnerID}`;
-        let runnerLink = `View the [following link](https://github.com/${owner}/${repo}/actions/runs/${currentRunnerID})` +
-            ` to download the report.`;
-        if (create_new_issue) {
-
-            let msg = actionHelper.createMessage(currentReport['site'], runnerInfo, runnerLink);
-            const newIssue = await octokit.issues.create({
-                owner: owner,
-                repo: repo,
-                title: issueTitle,
-                body: msg
-            });
-            console.log(`Process completed successfully and a new issue #${newIssue.data.number} has been created for the ZAP Scan.`);
-
-        } else {
-
-            let siteClone = actionHelper.generateDifference(currentReport, previousReport);
-            if (currentReport.updated) {
-                console.log('The current report has changes compared to the previous report');
-                try{
-                    let msg = actionHelper.createMessage(siteClone, runnerInfo, runnerLink);
-                    await octokit.issues.createComment({
-                        owner: owner,
-                        repo: repo,
-                        issue_number: openIssue['number'],
-                        body: msg
-                    });
-
-                    console.log(`The issue #${openIssue.number} has been updated with the latest ZAP scan results!`);
-                    console.log('ZAP Scan process completed successfully!');
-                }catch (err) {
-                    console.log(`Error occurred while updating the issue #${openIssue.number} with the latest ZAP scan: ${err}`)
-                }
-
-            } else {
-                console.log('No changes have been observed from the previous scan and current scan!, exiting the program!')
-            }
-        }
-
-        actionHelper.uploadArtifacts(workSpace, mdReportName, jsonReportName, htmlReportName);
-
-    })
+	return toStr.call(arr) === '[object Array]';
 };
 
+var isPlainObject = function isPlainObject(obj) {
+	if (!obj || toStr.call(obj) !== '[object Object]') {
+		return false;
+	}
 
-module.exports = {
-    main: actionCommon,
-    helper: actionHelper
+	var hasOwnConstructor = hasOwn.call(obj, 'constructor');
+	var hasIsPrototypeOf = obj.constructor && obj.constructor.prototype && hasOwn.call(obj.constructor.prototype, 'isPrototypeOf');
+	// Not own constructor property must be Object
+	if (obj.constructor && !hasOwnConstructor && !hasIsPrototypeOf) {
+		return false;
+	}
+
+	// Own properties are enumerated firstly, so to speed up,
+	// if last one is own, then all properties are own.
+	var key;
+	for (key in obj) { /**/ }
+
+	return typeof key === 'undefined' || hasOwn.call(obj, key);
+};
+
+// If name is '__proto__', and Object.defineProperty is available, define __proto__ as an own property on target
+var setProperty = function setProperty(target, options) {
+	if (defineProperty && options.name === '__proto__') {
+		defineProperty(target, options.name, {
+			enumerable: true,
+			configurable: true,
+			value: options.newValue,
+			writable: true
+		});
+	} else {
+		target[options.name] = options.newValue;
+	}
+};
+
+// Return undefined instead of __proto__ if '__proto__' is not an own property
+var getProperty = function getProperty(obj, name) {
+	if (name === '__proto__') {
+		if (!hasOwn.call(obj, name)) {
+			return void 0;
+		} else if (gOPD) {
+			// In early versions of node, obj['__proto__'] is buggy when obj has
+			// __proto__ as an own property. Object.getOwnPropertyDescriptor() works.
+			return gOPD(obj, name).value;
+		}
+	}
+
+	return obj[name];
+};
+
+module.exports = function extend() {
+	var options, name, src, copy, copyIsArray, clone;
+	var target = arguments[0];
+	var i = 1;
+	var length = arguments.length;
+	var deep = false;
+
+	// Handle a deep copy situation
+	if (typeof target === 'boolean') {
+		deep = target;
+		target = arguments[1] || {};
+		// skip the boolean and the target
+		i = 2;
+	}
+	if (target == null || (typeof target !== 'object' && typeof target !== 'function')) {
+		target = {};
+	}
+
+	for (; i < length; ++i) {
+		options = arguments[i];
+		// Only deal with non-null/undefined values
+		if (options != null) {
+			// Extend the base object
+			for (name in options) {
+				src = getProperty(target, name);
+				copy = getProperty(options, name);
+
+				// Prevent never-ending loop
+				if (target !== copy) {
+					// Recurse if we're merging plain objects or arrays
+					if (deep && copy && (isPlainObject(copy) || (copyIsArray = isArray(copy)))) {
+						if (copyIsArray) {
+							copyIsArray = false;
+							clone = src && isArray(src) ? src : [];
+						} else {
+							clone = src && isPlainObject(src) ? src : {};
+						}
+
+						// Never move original objects, clone them
+						setProperty(target, { name: name, newValue: extend(deep, clone, copy) });
+
+					// Don't bring in undefined values
+					} else if (typeof copy !== 'undefined') {
+						setProperty(target, { name: name, newValue: copy });
+					}
+				}
+			}
+		}
+	}
+
+	// Return the modified object
+	return target;
 };
 
 
@@ -22079,7 +21751,7 @@ module.exports = require("stream");
 var fs = __webpack_require__(747)
 var qs = __webpack_require__(191)
 var validate = __webpack_require__(846)
-var extend = __webpack_require__(930)
+var extend = __webpack_require__(374)
 
 function Har (request) {
   this.request = request
@@ -25117,7 +24789,7 @@ var mime = __webpack_require__(779)
 var caseless = __webpack_require__(254)
 var ForeverAgent = __webpack_require__(792)
 var FormData = __webpack_require__(928)
-var extend = __webpack_require__(930)
+var extend = __webpack_require__(374)
 var isstream = __webpack_require__(382)
 var isTypedArray = __webpack_require__(944).strict
 var helpers = __webpack_require__(810)
@@ -53907,7 +53579,207 @@ exports.Deprecation = Deprecation;
 
 /***/ }),
 /* 693 */,
-/* 694 */,
+/* 694 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+const core = __webpack_require__(470);
+const exec = __webpack_require__(986);
+const fs = __webpack_require__(747);
+const github = __webpack_require__(469);
+const _ = __webpack_require__(557);
+const actionHelper = __webpack_require__(989);
+const { DEFAULT_OPTIONS } = __webpack_require__(995);
+
+let actionCommon = {
+    processReport: (async (token, workSpace, plugins, currentRunnerID, issueTitle, repoName, { allowIssueWriting, artifactName } = DEFAULT_OPTIONS) => {
+        let jsonReportName = 'report_json.json';
+        let mdReportName = 'report_md.md';
+        let htmlReportName = 'report_html.html';
+
+        if (!allowIssueWriting) {
+            actionHelper.uploadArtifacts(workSpace, mdReportName, jsonReportName, htmlReportName);
+            return;
+        }
+
+        let openIssue;
+        let currentReport;
+        let previousRunnerID;
+        let previousReport = {};
+        let create_new_issue = false;
+
+        // Forward variable declarations
+        let octokit;
+        let context;
+        let owner;
+        let repo;
+
+        let tmp = repoName.split('/');
+        owner = tmp[0];
+        repo = tmp[1];
+
+        octokit = await new github.GitHub(token);
+        context = github.context;
+
+        try {
+            let jReportFile = fs.readFileSync(`${workSpace}/${jsonReportName}`);
+            currentReport = JSON.parse(jReportFile);
+        } catch (e) {
+            console.log('Failed to locate the json report generated by ZAP Scan!');
+            return
+        }
+
+        let issues = await octokit.search.issuesAndPullRequests({
+            q: encodeURI(`is:issue state:open repo:${owner}/${repo} ${issueTitle}`).replace(/%20/g,'+'),
+            sort: 'updated'
+        });
+
+        // If there is no existing open issue then create a new issue
+        if (issues.data.items.length === 0) {
+            create_new_issue = true;
+        }else {
+            // Sometimes search API returns recently closed issue as an open issue
+            for (let i = 0; i < issues.data.items.length; i++) {
+                let issue = issues.data.items[i];
+                if(issue['state'] === 'open' && issue['user']['login'] === 'github-actions[bot]'){
+                    openIssue = issue;
+                    break
+                }
+            }
+
+            if (openIssue === undefined) {
+                create_new_issue = true;
+            }else {
+                console.log(`Ongoing open issue has been identified #${openIssue['number']}`);
+                // If there is no comments then read the body
+                if (openIssue['comments'] === 0) {
+                    previousRunnerID = actionHelper.getRunnerID(openIssue['body']);
+                }else {
+                    let comments = await octokit.issues.listComments({
+                        owner: owner,
+                        repo: repo,
+                        issue_number: openIssue['number']
+                    });
+
+                    let lastBotComment;
+                    let lastCommentIndex = comments['data'].length - 1;
+                    for (let i = lastCommentIndex; i >= 0; i--) {
+                        if (comments['data'][i]['user']['login'] === 'github-actions[bot]') {
+                            lastBotComment = comments['data'][i];
+                            break;
+                        }
+                    }
+
+                    if (lastBotComment === undefined) {
+                        previousRunnerID = actionHelper.getRunnerID(openIssue['body']);
+                    }else {
+                        previousRunnerID = actionHelper.getRunnerID(lastBotComment['body']);
+                    }
+                }
+
+                if (previousRunnerID !== null) {
+                    previousReport = await actionHelper.readPreviousReport(octokit, owner, repo, workSpace, previousRunnerID, { artifactName });
+                    if (previousReport === undefined) {
+                        create_new_issue = true;
+                    }
+                }
+            }
+        }
+
+        if (plugins.length !== 0) {
+            console.log(`${plugins.length} plugins will be ignored according to the rules configuration`);
+            currentReport = await actionHelper.filterReport(currentReport, plugins);
+
+            // Update the newly filtered report
+            fs.unlinkSync(`${workSpace}/${jsonReportName}`);
+            fs.writeFileSync(`${workSpace}/${jsonReportName}`, JSON.stringify(currentReport));
+            console.log('The current report is updated with the ignored alerts!')
+        }
+
+        let newAlertExits = actionHelper.checkIfAlertsExists(currentReport);
+
+        console.log(`Alerts present in the current report: ${newAlertExits}`);
+
+        if (!newAlertExits) {
+            // If no new alerts have been found close the issue
+            console.log('No new alerts have been identified by the ZAP Scan');
+            if (openIssue != null && openIssue.state === 'open') {
+                // close the issue with a comment
+                console.log(`Starting to close the issue #${openIssue.number}`);
+                try{
+                    await octokit.issues.createComment({
+                        owner: owner,
+                        repo: repo,
+                        issue_number: openIssue.number,
+                        body: 'All the alerts have been resolved during the last ZAP Scan!'
+                    });
+                    await octokit.issues.update({
+                        owner: owner,
+                        repo: repo,
+                        issue_number: openIssue.number,
+                        state: 'closed'
+                    });
+                    console.log(`Successfully closed the issue #${openIssue.number}`);
+                }catch (err) {
+                    console.log(`Error occurred while closing the issue with a comment! err: ${err}`)
+                }
+            }else if (openIssue != null && openIssue.state === 'closed') {
+                console.log('No alerts found by ZAP Scan and no active issue is found in the repository, exiting the program!');
+            }
+            return;
+        }
+
+        let runnerInfo = `RunnerID:${currentRunnerID}`;
+        let runnerLink = `View the [following link](https://github.com/${owner}/${repo}/actions/runs/${currentRunnerID})` +
+            ` to download the report.`;
+        if (create_new_issue) {
+
+            let msg = actionHelper.createMessage(currentReport['site'], runnerInfo, runnerLink);
+            const newIssue = await octokit.issues.create({
+                owner: owner,
+                repo: repo,
+                title: issueTitle,
+                body: msg
+            });
+            console.log(`Process completed successfully and a new issue #${newIssue.data.number} has been created for the ZAP Scan.`);
+
+        } else {
+
+            let siteClone = actionHelper.generateDifference(currentReport, previousReport);
+            if (currentReport.updated) {
+                console.log('The current report has changes compared to the previous report');
+                try{
+                    let msg = actionHelper.createMessage(siteClone, runnerInfo, runnerLink);
+                    await octokit.issues.createComment({
+                        owner: owner,
+                        repo: repo,
+                        issue_number: openIssue['number'],
+                        body: msg
+                    });
+
+                    console.log(`The issue #${openIssue.number} has been updated with the latest ZAP scan results!`);
+                    console.log('ZAP Scan process completed successfully!');
+                }catch (err) {
+                    console.log(`Error occurred while updating the issue #${openIssue.number} with the latest ZAP scan: ${err}`)
+                }
+
+            } else {
+                console.log('No changes have been observed from the previous scan and current scan!, exiting the program!')
+            }
+        }
+
+        actionHelper.uploadArtifacts(workSpace, mdReportName, jsonReportName, htmlReportName, { artifactName });
+
+    })
+};
+
+
+module.exports = {
+    main: actionCommon,
+    helper: actionHelper
+};
+
+
+/***/ }),
 /* 695 */,
 /* 696 */
 /***/ (function(module) {
@@ -60243,7 +60115,7 @@ module.exports = v4;
 
 
 
-var extend = __webpack_require__(930)
+var extend = __webpack_require__(374)
 var cookies = __webpack_require__(35)
 var helpers = __webpack_require__(810)
 
@@ -81710,130 +81582,7 @@ function hasNextPage (link) {
 
 
 /***/ }),
-/* 930 */
-/***/ (function(module) {
-
-"use strict";
-
-
-var hasOwn = Object.prototype.hasOwnProperty;
-var toStr = Object.prototype.toString;
-var defineProperty = Object.defineProperty;
-var gOPD = Object.getOwnPropertyDescriptor;
-
-var isArray = function isArray(arr) {
-	if (typeof Array.isArray === 'function') {
-		return Array.isArray(arr);
-	}
-
-	return toStr.call(arr) === '[object Array]';
-};
-
-var isPlainObject = function isPlainObject(obj) {
-	if (!obj || toStr.call(obj) !== '[object Object]') {
-		return false;
-	}
-
-	var hasOwnConstructor = hasOwn.call(obj, 'constructor');
-	var hasIsPrototypeOf = obj.constructor && obj.constructor.prototype && hasOwn.call(obj.constructor.prototype, 'isPrototypeOf');
-	// Not own constructor property must be Object
-	if (obj.constructor && !hasOwnConstructor && !hasIsPrototypeOf) {
-		return false;
-	}
-
-	// Own properties are enumerated firstly, so to speed up,
-	// if last one is own, then all properties are own.
-	var key;
-	for (key in obj) { /**/ }
-
-	return typeof key === 'undefined' || hasOwn.call(obj, key);
-};
-
-// If name is '__proto__', and Object.defineProperty is available, define __proto__ as an own property on target
-var setProperty = function setProperty(target, options) {
-	if (defineProperty && options.name === '__proto__') {
-		defineProperty(target, options.name, {
-			enumerable: true,
-			configurable: true,
-			value: options.newValue,
-			writable: true
-		});
-	} else {
-		target[options.name] = options.newValue;
-	}
-};
-
-// Return undefined instead of __proto__ if '__proto__' is not an own property
-var getProperty = function getProperty(obj, name) {
-	if (name === '__proto__') {
-		if (!hasOwn.call(obj, name)) {
-			return void 0;
-		} else if (gOPD) {
-			// In early versions of node, obj['__proto__'] is buggy when obj has
-			// __proto__ as an own property. Object.getOwnPropertyDescriptor() works.
-			return gOPD(obj, name).value;
-		}
-	}
-
-	return obj[name];
-};
-
-module.exports = function extend() {
-	var options, name, src, copy, copyIsArray, clone;
-	var target = arguments[0];
-	var i = 1;
-	var length = arguments.length;
-	var deep = false;
-
-	// Handle a deep copy situation
-	if (typeof target === 'boolean') {
-		deep = target;
-		target = arguments[1] || {};
-		// skip the boolean and the target
-		i = 2;
-	}
-	if (target == null || (typeof target !== 'object' && typeof target !== 'function')) {
-		target = {};
-	}
-
-	for (; i < length; ++i) {
-		options = arguments[i];
-		// Only deal with non-null/undefined values
-		if (options != null) {
-			// Extend the base object
-			for (name in options) {
-				src = getProperty(target, name);
-				copy = getProperty(options, name);
-
-				// Prevent never-ending loop
-				if (target !== copy) {
-					// Recurse if we're merging plain objects or arrays
-					if (deep && copy && (isPlainObject(copy) || (copyIsArray = isArray(copy)))) {
-						if (copyIsArray) {
-							copyIsArray = false;
-							clone = src && isArray(src) ? src : [];
-						} else {
-							clone = src && isPlainObject(src) ? src : {};
-						}
-
-						// Never move original objects, clone them
-						setProperty(target, { name: name, newValue: extend(deep, clone, copy) });
-
-					// Don't bring in undefined values
-					} else if (typeof copy !== 'undefined') {
-						setProperty(target, { name: name, newValue: copy });
-					}
-				}
-			}
-		}
-	}
-
-	// Return the modified object
-	return target;
-};
-
-
-/***/ }),
+/* 930 */,
 /* 931 */,
 /* 932 */,
 /* 933 */,
@@ -85073,7 +84822,265 @@ exports.exec = exec;
 /***/ }),
 /* 987 */,
 /* 988 */,
-/* 989 */,
+/* 989 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+const fs = __webpack_require__(747);
+const _ = __webpack_require__(557);
+const readline = __webpack_require__(58);
+const AdmZip = __webpack_require__(639);
+const request = __webpack_require__(830);
+const artifact = __webpack_require__(214);
+const { DEFAULT_OPTIONS } = __webpack_require__(995);
+
+function createReadStreamSafe(filename, options) {
+    return new Promise((resolve, reject) => {
+        const fileStream = fs.createReadStream(filename, options);
+        fileStream.on('error', reject).on('open', () => {
+            resolve(fileStream);
+        });
+    });
+}
+
+let actionHelper = {
+
+    getRunnerID: ((body) => {
+        let results = body.match('RunnerID:\\d+');
+        if (results !== null && results.length !== 0) {
+            return results[0].split(':')[1];
+        }
+        return null;
+    }),
+
+    processLineByLine: (async (tsvFile) => {
+        let plugins = [];
+        try {
+            const fileStream = await createReadStreamSafe(tsvFile);
+            const rl = readline.createInterface({
+                input: fileStream,
+                crlfDelay: Infinity
+            });
+            for await (const line of rl) {
+                if (line.charAt(0) !== '#') {
+                    let tmp = line.split('\t');
+                    if (tmp[0].trim() !== '' && tmp[1].trim().toUpperCase() === 'IGNORE') {
+                        plugins.push(tmp[0].trim());
+                    }
+                }
+            }
+        } catch (err) {
+            console.log(`Error when reading the rules file: ${tsvFile}`)
+        }
+
+        return plugins;
+    }),
+
+    createMessage: ((sites, runnerID, runnerLink) => {
+        const NXT_LINE = '\n';
+        const TAB = "\t";
+        const BULLET = "-";
+        let msg = '';
+        let instanceCount = 5;
+
+        sites.forEach((site => {
+            msg = msg + `${BULLET} Site: [${site["@name"]}](${site["@name"]}) ${NXT_LINE}`;
+            if (site.hasOwnProperty('alerts')) {
+                if (site.alerts.length !== 0) {
+                    msg = `${msg} ${TAB} **New Alerts** ${NXT_LINE}`;
+                    site.alerts.forEach((alert) => {
+                        msg = msg + TAB + `${BULLET} **${alert.name}** [${alert.pluginid}] total: ${alert.instances.length}:  ${NXT_LINE}`
+
+                        for (let i = 0; i < alert['instances'].length; i++) {
+                            if (i >= instanceCount) {
+                                msg = msg + TAB + TAB + `${BULLET} .. ${NXT_LINE}`;
+                                break
+                            }
+                            let instance = alert['instances'][i];
+                            msg = msg + TAB + TAB + `${BULLET} [${instance.uri}](${instance.uri}) ${NXT_LINE}`;
+                        }
+                    });
+                    msg = msg + NXT_LINE
+                }
+            }
+
+            if (site.hasOwnProperty('removedAlerts')) {
+                if (site.removedAlerts.length !== 0) {
+                    msg = `${msg} ${TAB} **Resolved Alerts** ${NXT_LINE}`;
+                    site.removedAlerts.forEach((alert) => {
+                        msg = msg + TAB + `${BULLET} **${alert.name}** [${alert.pluginid}] total: ${alert.instances.length}:  ${NXT_LINE}`
+                    });
+                    msg = msg + NXT_LINE
+                }
+            }
+
+            if (site.hasOwnProperty('ignoredAlerts')) {
+                if (site.ignoredAlerts.length !== 0) {
+                    msg = `${msg} ${TAB} **Ignored Alerts** ${NXT_LINE}`;
+                    site.ignoredAlerts.forEach((alert) => {
+                        msg = msg + TAB + `${BULLET} **${alert.name}** [${alert.pluginid}] total: ${alert.instances.length}:  ${NXT_LINE}`
+                    });
+                    msg = msg + NXT_LINE
+                }
+            }
+
+            msg = msg + NXT_LINE
+        }));
+        if (msg.trim() !== '') {
+            msg = msg + NXT_LINE + runnerLink;
+            msg = msg + NXT_LINE + runnerID;
+        }
+        return msg
+    }),
+
+    generateDifference: ((newReport, oldReport) => {
+        newReport.updated = false;
+        let siteClone = [];
+        newReport.site.forEach((newReportSite) => {
+            // Check if the new report site already exists in the previous report
+            let previousSite = _.filter(oldReport.site, s => s['@name'] === newReportSite['@name']);
+            // If does not exists add it to the array without further processing
+            if (previousSite.length === 0) {
+                newReport.updated = true;
+                siteClone.push(newReportSite);
+            } else {
+                // deep clone the variable for further processing
+                let newSite = JSON.parse(JSON.stringify(newReportSite));
+                let currentAlerts = newReportSite.alerts;
+                let previousAlerts = previousSite[0].alerts;
+
+                let newAlerts = _.differenceBy(currentAlerts, previousAlerts, 'pluginid');
+                let removedAlerts = _.differenceBy(previousAlerts, currentAlerts, 'pluginid');
+
+                let ignoredAlerts = [];
+                if (newReportSite.hasOwnProperty('ignoredAlerts') && previousSite[0].hasOwnProperty('ignoredAlerts')) {
+                    ignoredAlerts = _.differenceBy(newReportSite['ignoredAlerts'], previousSite[0]['ignoredAlerts'], 'pluginid');
+                }else if(newReportSite.hasOwnProperty('ignoredAlerts')){
+                    ignoredAlerts = newReportSite['ignoredAlerts']
+                }
+
+                removedAlerts = _.differenceBy(removedAlerts, ignoredAlerts, 'pluginid');
+
+                newSite.alerts = newAlerts;
+                newSite.removedAlerts = removedAlerts;
+                newSite.ignoredAlerts = ignoredAlerts;
+                siteClone.push(newSite);
+
+                if (newAlerts.length !== 0 || removedAlerts.length !== 0 || ignoredAlerts.length !== 0) {
+                    newReport.updated = true;
+                }
+            }
+        });
+        return siteClone;
+    }),
+
+    readMDFile: (async (reportName) => {
+        let res = '';
+        try {
+            res = fs.readFileSync(reportName, {encoding: 'base64'});
+        } catch (err) {
+            console.log('error while reading the markdown file!')
+        }
+        return res;
+    }),
+
+    checkIfAlertsExists: ((jsonReport) => {
+        return jsonReport.site.some((s) => {
+            return (s.hasOwnProperty('alerts') && s.alerts.length !== 0);
+        });
+    }),
+
+
+    filterReport: (async (jsonReport, plugins) => {
+        jsonReport.site.forEach((s) => {
+            if (s.hasOwnProperty('alerts') && s.alerts.length !== 0) {
+                console.log(`starting to filter the alerts for site: ${s['@name']}`);
+                let newAlerts = s.alerts.filter(function (e) {
+                    return !plugins.includes(e.pluginid)
+                });
+                let removedAlerts = s.alerts.filter(function (e) {
+                    return plugins.includes(e.pluginid)
+                });
+                s.alerts = newAlerts;
+                s.ignoredAlerts = removedAlerts;
+
+                console.log(`#${newAlerts.length} alerts have been identified` +
+                    ` and #${removedAlerts.length} alerts have been ignored for the site.`);
+            }
+        });
+        return jsonReport;
+    }),
+
+
+    readPreviousReport: (async (octokit, owner, repo, workSpace, runnerID, { artifactName } = DEFAULT_OPTIONS) => {
+        let previousReport;
+        try{
+            let artifactList = await octokit.actions.listWorkflowRunArtifacts({
+                owner: owner,
+                repo: repo,
+                run_id: runnerID
+            });
+
+            let artifacts = artifactList.data.artifacts;
+            let artifactID;
+            if (artifacts.length !== 0) {
+                artifacts.forEach((a => {
+                    if (a['name'] === artifactName) {
+                        artifactID = a['id']
+                    }
+                }));
+            }
+
+            if (artifactID !== undefined) {
+                let download = await octokit.actions.downloadArtifact({
+                    owner: owner,
+                    repo: repo,
+                    artifact_id: artifactID,
+                    archive_format: 'zip'
+                });
+
+                await new Promise(resolve =>
+                    request(download.url)
+                        .pipe(fs.createWriteStream(`${workSpace}/${artifactName}.zip`))
+                        .on('finish', () => {
+                            resolve();
+                        }));
+
+                let zip = new AdmZip(`${workSpace}/${artifactName}.zip`);
+                let zipEntries = zip.getEntries();
+
+                await zipEntries.forEach(function (zipEntry) {
+                    if (zipEntry.entryName === "report_json.json") {
+                        previousReport = JSON.parse(zipEntry.getData().toString('utf8'));
+                    }
+                });
+            }
+        }catch (e) {
+            console.log(`Error occurred while downloading the artifacts!`)
+        }
+        return previousReport;
+    }),
+
+    uploadArtifacts: (async (rootDir, mdReport, jsonReport, htmlReport, { artifactName } = DEFAULT_OPTIONS) => {
+        const artifactClient = artifact.create();
+        const files = [
+            `${rootDir}/${mdReport}`,
+            `${rootDir}/${jsonReport}`,
+            `${rootDir}/${htmlReport}`,
+        ];
+        const rootDirectory = rootDir;
+        const options = {
+            continueOnError: true
+        };
+
+        await artifactClient.uploadArtifact(artifactName, files, rootDirectory, options)
+    })
+
+};
+
+module.exports = actionHelper;
+
+
+/***/ }),
 /* 990 */,
 /* 991 */,
 /* 992 */,
@@ -85084,7 +85091,18 @@ module.exports = {"$id":"cache.json#","$schema":"http://json-schema.org/draft-06
 
 /***/ }),
 /* 994 */,
-/* 995 */,
+/* 995 */
+/***/ (function(module) {
+
+module.exports = {
+    DEFAULT_OPTIONS: {
+      allowIssueWriting: true,
+      artifactName: 'zap_scan',
+    }
+}
+
+
+/***/ }),
 /* 996 */,
 /* 997 */,
 /* 998 */
